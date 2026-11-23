@@ -1,0 +1,1077 @@
+//! Programa de reservas de canchas de básquetbol en Solana.
+//!
+//! Cuentas:
+//! * `Cancha`: la crea un administrador con una keypair generada por el
+//!   cliente. Guarda nombre, ubicación, precio por hora y su administrador.
+//! * `Reserva`: PDA derivada de las seeds
+//!   `["reserva", cancha_pubkey, fecha, hora_inicio]`.
+//!   La PDA es única por cancha + fecha + hora, por lo que un horario no
+//!   se puede reservar dos veces: si la PDA ya existe, `crear_reserva`
+//!   falla al intentar inicializarla.
+//!
+//! La fecha se guarda como texto `YYYY-MM-DD` (legible en el frontend) y
+//! además como `inicio_unix` (segundos desde epoch, UTC), que es lo que
+//! el programa usa para la regla de cancelación (> 2 horas de antelación).
+//! El cliente calcula `inicio_unix` a partir de la fecha y la hora; el
+//! programa nunca confía en un reloj enviado por el cliente: para la
+//! cancelación usa el sysvar `Clock` on-chain.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::Sysvar;
+
+declare_id!("BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ");
+
+/// Dos horas, en segundos. Una reserva solo puede cancelarse si faltan
+/// más de `VENTANA_CANCELACION_SEGUNDOS` para su inicio.
+pub const VENTANA_CANCELACION_SEGUNDOS: i64 = 2 * 3600;
+
+#[program]
+pub mod reservas_canchas {
+    use super::*;
+
+    /// Crea una cancha. Solo la firma quien paga la cuenta; ese firmante
+    /// queda registrado como administrador de la cancha.
+    pub fn crear_cancha(
+        ctx: Context<CrearCancha>,
+        nombre: String,
+        ubicacion: String,
+        precio_por_hora: u64,
+    ) -> Result<()> {
+        require!(nombre.len() <= 32, ErrorCode::TextoDemasiadoLargo);
+        require!(ubicacion.len() <= 64, ErrorCode::TextoDemasiadoLargo);
+        require!(precio_por_hora > 0, ErrorCode::PrecioInvalido);
+
+        ctx.accounts.cancha.set_inner(Cancha {
+            nombre,
+            ubicacion,
+            precio_por_hora,
+            administrador: *ctx.accounts.administrador.key,
+            activa: true,
+        });
+        Ok(())
+    }
+
+    /// Crea una reserva en estado Pendiente.
+    ///
+    /// La cuenta `reserva` es una PDA con seeds
+    /// `["reserva", cancha, fecha, hora_inicio]`. Si esa PDA ya existe
+    /// (el horario ya está reservado), la inicialización falla y la
+    /// transacción se revierte: es la garantía on-chain contra la doble
+    /// reserva, sin depender del frontend.
+    pub fn crear_reserva(
+        ctx: Context<CrearReserva>,
+        fecha: String,
+        hora_inicio: u8,
+        inicio_unix: i64,
+    ) -> Result<()> {
+        require!(fecha.len() == 10, ErrorCode::FechaInvalida);
+        require!(hora_inicio <= 23, ErrorCode::HoraInvalida);
+        require!(ctx.accounts.cancha.activa, ErrorCode::CanchaInactiva);
+
+        ctx.accounts.reserva.set_inner(Reserva {
+            cancha: ctx.accounts.cancha.key(),
+            usuario: *ctx.accounts.usuario.key,
+            fecha,
+            hora_inicio,
+            inicio_unix,
+            estado: EstadoReserva::Pendiente,
+            bump: ctx.bumps.reserva,
+        });
+        Ok(())
+    }
+
+    /// Confirma una reserva Pendiente. Solo el administrador de la cancha.
+    pub fn confirmar_reserva(ctx: Context<ConfirmarReserva>) -> Result<()> {
+        let reserva = &mut ctx.accounts.reserva;
+        require!(
+            reserva.estado == EstadoReserva::Pendiente,
+            ErrorCode::ReservaNoPendiente
+        );
+        reserva.estado = EstadoReserva::Confirmada;
+        Ok(())
+    }
+
+    /// Cambia la hora de una reserva Pendiente. Solo su dueño.
+    ///
+    /// La hora forma parte de las seeds de la PDA, así que cambiarla
+    /// significa cambiar de cuenta: la instrucción cierra la PDA antigua
+    /// (devolviendo sus lamports al usuario) y crea la PDA nueva con las
+    /// seeds del horario nuevo. Si el horario nuevo ya está ocupado, la
+    /// inicialización de la PDA nueva falla y no se pierde la reserva
+    /// antigua, porque la transacción completa se revierte.
+    pub fn cambiar_hora(
+        ctx: Context<CambiarHora>,
+        nueva_hora_inicio: u8,
+        nuevo_inicio_unix: i64,
+    ) -> Result<()> {
+        require!(nueva_hora_inicio <= 23, ErrorCode::HoraInvalida);
+        let antigua = &ctx.accounts.reserva_antigua;
+        require!(
+            antigua.estado == EstadoReserva::Pendiente,
+            ErrorCode::ReservaNoPendiente
+        );
+        require!(
+            nueva_hora_inicio != antigua.hora_inicio,
+            ErrorCode::HoraInvalida
+        );
+
+        ctx.accounts.reserva_nueva.set_inner(Reserva {
+            cancha: antigua.cancha,
+            usuario: antigua.usuario,
+            fecha: antigua.fecha.clone(),
+            hora_inicio: nueva_hora_inicio,
+            inicio_unix: nuevo_inicio_unix,
+            estado: EstadoReserva::Pendiente,
+            bump: ctx.bumps.reserva_nueva,
+        });
+        Ok(())
+    }
+
+    /// Marca una reserva Confirmada como Completada (la cancha ya se usó).
+    /// Solo el administrador de la cancha. Una reserva Completada ya no
+    /// se puede cancelar: esa es la otra mitad de la regla de cierre.
+    pub fn completar_reserva(ctx: Context<CompletarReserva>) -> Result<()> {
+        let reserva = &mut ctx.accounts.reserva;
+        require!(
+            reserva.estado == EstadoReserva::Confirmada,
+            ErrorCode::ReservaNoConfirmada
+        );
+        reserva.estado = EstadoReserva::Completada;
+        Ok(())
+    }
+
+    /// Cancela una reserva y cierra su cuenta.
+    ///
+    /// Regla del programa (cierre condicionado): solo se cierra si
+    /// faltan más de 2 horas para el inicio (`inicio_unix - ahora >
+    /// 7200`) y el estado no es `Completada` (ni `Cancelada`). Si no se
+    /// cumple, la transacción falla con `CancelacionNoPermitida` y la
+    /// cuenta sigue existiendo. Al cerrarse, los lamports de la renta se
+    /// devuelven al usuario (`close = usuario`).
+    pub fn cancelar_reserva(ctx: Context<CancelarReserva>) -> Result<()> {
+        let reserva = &ctx.accounts.reserva;
+        require!(
+            reserva.estado != EstadoReserva::Completada
+                && reserva.estado != EstadoReserva::Cancelada,
+            ErrorCode::CancelacionNoPermitida
+        );
+        let ahora = Clock::get()?.unix_timestamp;
+        require!(
+            reserva.inicio_unix - ahora > VENTANA_CANCELACION_SEGUNDOS,
+            ErrorCode::CancelacionNoPermitida
+        );
+        // No hace falta poner estado = Cancelada: la cuenta se cierra
+        // con `close = usuario` en el struct de cuentas.
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cuentas
+// ---------------------------------------------------------------------------
+
+#[derive(Accounts)]
+pub struct CrearCancha<'info> {
+    #[account(
+        init,
+        payer = administrador,
+        space = Cancha::SPACE,
+    )]
+    pub cancha: Account<'info, Cancha>,
+    #[account(mut)]
+    pub administrador: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(fecha: String, hora_inicio: u8)]
+pub struct CrearReserva<'info> {
+    #[account(
+        init,
+        payer = usuario,
+        space = Reserva::SPACE,
+        seeds = [b"reserva", cancha.key().as_ref(), fecha.as_bytes(), &[hora_inicio]],
+        bump,
+    )]
+    pub reserva: Account<'info, Reserva>,
+    #[account(mut)]
+    pub cancha: Account<'info, Cancha>,
+    #[account(mut)]
+    pub usuario: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ConfirmarReserva<'info> {
+    #[account(
+        mut,
+        has_one = cancha,
+        constraint = administrador.key() == cancha.administrador
+            @ ErrorCode::AccesoNoAutorizado,
+    )]
+    pub reserva: Account<'info, Reserva>,
+    pub cancha: Account<'info, Cancha>,
+    pub administrador: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(nueva_hora_inicio: u8)]
+pub struct CambiarHora<'info> {
+    #[account(
+        mut,
+        close = usuario,
+        has_one = cancha,
+        has_one = usuario,
+    )]
+    pub reserva_antigua: Account<'info, Reserva>,
+    #[account(
+        init,
+        payer = usuario,
+        space = Reserva::SPACE,
+        seeds = [b"reserva", cancha.key().as_ref(), reserva_antigua.fecha.as_bytes(), &[nueva_hora_inicio]],
+        bump,
+    )]
+    pub reserva_nueva: Account<'info, Reserva>,
+    pub cancha: Account<'info, Cancha>,
+    #[account(mut)]
+    pub usuario: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CompletarReserva<'info> {
+    #[account(
+        mut,
+        has_one = cancha,
+        constraint = administrador.key() == cancha.administrador
+            @ ErrorCode::AccesoNoAutorizado,
+    )]
+    pub reserva: Account<'info, Reserva>,
+    pub cancha: Account<'info, Cancha>,
+    pub administrador: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelarReserva<'info> {
+    #[account(
+        mut,
+        close = usuario,
+        has_one = cancha,
+        has_one = usuario,
+    )]
+    pub reserva: Account<'info, Reserva>,
+    pub cancha: Account<'info, Cancha>,
+    #[account(mut)]
+    pub usuario: Signer<'info>,
+}
+
+// ---------------------------------------------------------------------------
+// Datos guardados en las cuentas
+// ---------------------------------------------------------------------------
+
+#[account]
+pub struct Cancha {
+    /// Nombre de la cancha, máx. 32 caracteres.
+    pub nombre: String,
+    /// Ubicación, máx. 64 caracteres.
+    pub ubicacion: String,
+    /// Precio por hora, en lamports.
+    pub precio_por_hora: u64,
+    /// Wallet del administrador que la creó.
+    pub administrador: Pubkey,
+    /// Si es false, no se aceptan reservas nuevas.
+    pub activa: bool,
+}
+
+impl Cancha {
+    /// 8 (discriminador) + (4 + 32) nombre + (4 + 64) ubicación
+    /// + 8 precio + 32 administrador + 1 activa.
+    pub const SPACE: usize = 8 + 36 + 68 + 8 + 32 + 1;
+}
+
+#[account]
+pub struct Reserva {
+    /// Cancha reservada.
+    pub cancha: Pubkey,
+    /// Wallet del usuario que reservó.
+    pub usuario: Pubkey,
+    /// Fecha en formato `YYYY-MM-DD`.
+    pub fecha: String,
+    /// Hora de inicio (0-23).
+    pub hora_inicio: u8,
+    /// Inicio de la reserva en segundos desde epoch (UTC).
+    pub inicio_unix: i64,
+    /// Estado actual de la reserva.
+    pub estado: EstadoReserva,
+    /// Bump de la PDA.
+    pub bump: u8,
+}
+
+impl Reserva {
+    /// 8 (discriminador) + 32 cancha + 32 usuario + (4 + 10) fecha
+    /// + 1 hora_inicio + 8 inicio_unix + 1 estado + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 32 + 14 + 1 + 8 + 1 + 1;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum EstadoReserva {
+    Pendiente,
+    Confirmada,
+    Completada,
+    Cancelada,
+}
+
+// ---------------------------------------------------------------------------
+// Errores propios del programa
+// ---------------------------------------------------------------------------
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Solo el administrador o el dueño pueden realizar esta operación.")]
+    AccesoNoAutorizado,
+    #[msg("La cancelación no está permitida: faltan menos de 2 horas para el inicio o la reserva ya está completada/cancelada.")]
+    CancelacionNoPermitida,
+    #[msg("La reserva no está en estado Pendiente.")]
+    ReservaNoPendiente,
+    #[msg("La reserva no está en estado Confirmada.")]
+    ReservaNoConfirmada,
+    #[msg("La hora de inicio debe estar entre 0 y 23.")]
+    HoraInvalida,
+    #[msg("La fecha debe tener formato YYYY-MM-DD (10 caracteres).")]
+    FechaInvalida,
+    #[msg("La cancha no está activa.")]
+    CanchaInactiva,
+    #[msg("El precio por hora debe ser mayor que cero.")]
+    PrecioInvalido,
+    #[msg("El texto supera la longitud máxima permitida.")]
+    TextoDemasiadoLargo,
+}
+
+[package]
+name = "reservas-canchas"
+version = "0.1.0"
+description = "Programa de reservas de canchas de básquetbol en Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "reservas_canchas"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.1"
+
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { ReservasCanchas } from "../target/types/reservas_canchas";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import { assert } from "chai";
+
+/**
+ * Pruebas on-chain del programa de reservas de canchas de básquetbol.
+ *
+ * Cubren los 5 casos de evidencia de docs/PRUEBAS_Y_EVIDENCIAS.md:
+ *  E1 crear en horario libre -> Pendiente
+ *  E2 doble reserva del mismo slot -> falla
+ *  E3 cancelar por alguien que no es el dueño -> falla
+ *  E4 cancelar con > 2 h de antelación -> cierra la cuenta
+ *  E5 cancelar con < 2 h de antelación -> CancelacionNoPermitida
+ * Además: confirmar (solo admin), cambiar de hora y completar.
+ *
+ * Nota de diseño: la fecha (`YYYY-MM-DD`) y el `inicio_unix` de cada
+ * reserva siempre se corresponden. Por eso los horarios de prueba se
+ * calculan a partir de la hora actual: `slot(horas)` devuelve la fecha,
+ * la hora y el inicio en segundos del instante "ahora + horas".
+ */
+
+const PROGRAM_ID = new PublicKey(
+  "BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ"
+);
+
+interface Slot {
+  fecha: string;
+  hora: number;
+  inicio: number;
+}
+
+/** Instante futuro "ahora + horas", descompuesto en fecha/hora/inicio. */
+function slot(horasDesdeAhora: number): Slot {
+  const d = new Date(Date.now() + horasDesdeAhora * 3600 * 1000);
+  return {
+    fecha: d.toISOString().slice(0, 10),
+    hora: d.getUTCHours(),
+    inicio: Math.floor(d.getTime() / 1000),
+  };
+}
+
+function reservaPda(cancha: PublicKey, fecha: string, hora: number): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("reserva"),
+      cancha.toBuffer(),
+      Buffer.from(fecha),
+      Buffer.from([hora]),
+    ],
+    PROGRAM_ID
+  );
+}
+
+describe("reservas-canchas", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.ReservasCanchas as Program<ReservasCanchas>;
+
+  const admin = Keypair.generate();
+  const usuario = Keypair.generate();
+  const otroUsuario = Keypair.generate();
+  const cancha = Keypair.generate();
+
+  // Horarios de prueba, todos en el futuro y con fecha/inicio coherentes.
+  const slotA = slot(5); // E1, E2, confirmar, completar
+  const slotB = slot(6); // E3, E4
+  const slotC = slot(1); // E5 (menos de 2 h)
+  const slotD = slot(7); // cambiar de hora (origen)
+  const slotE = slot(8); // cambiar de hora (destino)
+
+  before(async () => {
+    // Fondea las wallets de prueba en devnet/localnet.
+    for (const kp of [admin, usuario, otroUsuario]) {
+      const sig = await provider.connection.requestAirdrop(kp.publicKey, 2_000_000_000);
+      await provider.connection.confirmTransaction(sig);
+    }
+    await program.methods
+      .crearCancha("Cancha Central", "Polideportivo Norte", new anchor.BN(150_000_000))
+      .accounts({ cancha: cancha.publicKey, administrador: admin.publicKey })
+      .signers([admin, cancha])
+      .rpc();
+  });
+
+  it("E1: crea una reserva en un horario libre (estado Pendiente)", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotA.fecha, slotA.hora);
+    await program.methods
+      .crearReserva(slotA.fecha, slotA.hora, new anchor.BN(slotA.inicio))
+      .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+      .signers([usuario])
+      .rpc();
+
+    const reserva = await program.account.reserva.fetch(pda);
+    assert.equal(reserva.estado.pendiente !== undefined, true);
+    assert.equal(reserva.horaInicio, slotA.hora);
+    assert.isTrue(reserva.usuario.equals(usuario.publicKey));
+  });
+
+  it("E2: no permite reservar dos veces el mismo horario", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotA.fecha, slotA.hora);
+    try {
+      await program.methods
+        .crearReserva(slotA.fecha, slotA.hora, new anchor.BN(slotA.inicio))
+        .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: otroUsuario.publicKey })
+        .signers([otroUsuario])
+        .rpc();
+      assert.fail("La doble reserva debería haber fallado");
+    } catch (err) {
+      assert.include(String(err), "already in use");
+    }
+  });
+
+  it("confirma una reserva solo el administrador de la cancha", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotA.fecha, slotA.hora);
+    await program.methods
+      .confirmarReserva()
+      .accounts({ reserva: pda, cancha: cancha.publicKey, administrador: admin.publicKey })
+      .signers([admin])
+      .rpc();
+    const reserva = await program.account.reserva.fetch(pda);
+    assert.equal(reserva.estado.confirmada !== undefined, true);
+  });
+
+  it("E3: un usuario que no es el dueño no puede cancelar la reserva", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotB.fecha, slotB.hora);
+    await program.methods
+      .crearReserva(slotB.fecha, slotB.hora, new anchor.BN(slotB.inicio))
+      .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+      .signers([usuario])
+      .rpc();
+
+    try {
+      await program.methods
+        .cancelarReserva()
+        .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: otroUsuario.publicKey })
+        .signers([otroUsuario])
+        .rpc();
+      assert.fail("La cancelación por un tercero debería haber fallado");
+    } catch (err) {
+      assert.include(String(err), "AccesoNoAutorizado");
+    }
+  });
+
+  it("E4: cancelar con más de 2 horas de antelación cierra la cuenta", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotB.fecha, slotB.hora);
+    await program.methods
+      .cancelarReserva()
+      .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+      .signers([usuario])
+      .rpc();
+
+    const reserva = await program.account.reserva.fetchNullable(pda);
+    assert.isNull(reserva, "La cuenta Reserva debería estar cerrada");
+  });
+
+  it("E5: cancelar con menos de 2 horas falla con CancelacionNoPermitida", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotC.fecha, slotC.hora);
+    await program.methods
+      .crearReserva(slotC.fecha, slotC.hora, new anchor.BN(slotC.inicio))
+      .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+      .signers([usuario])
+      .rpc();
+
+    try {
+      await program.methods
+        .cancelarReserva()
+        .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+        .signers([usuario])
+        .rpc();
+      assert.fail("La cancelación tardía debería haber fallado");
+    } catch (err) {
+      assert.include(String(err), "CancelacionNoPermitida");
+    }
+  });
+
+  it("cambiar de hora mueve la reserva a la PDA del horario nuevo", async () => {
+    const [pdaVieja] = reservaPda(cancha.publicKey, slotD.fecha, slotD.hora);
+    const [pdaNueva] = reservaPda(cancha.publicKey, slotE.fecha, slotE.hora);
+    await program.methods
+      .crearReserva(slotD.fecha, slotD.hora, new anchor.BN(slotD.inicio))
+      .accounts({ reserva: pdaVieja, cancha: cancha.publicKey, usuario: usuario.publicKey })
+      .signers([usuario])
+      .rpc();
+
+    await program.methods
+      .cambiarHora(slotE.hora, new anchor.BN(slotE.inicio))
+      .accounts({
+        reservaAntigua: pdaVieja,
+        reservaNueva: pdaNueva,
+        cancha: cancha.publicKey,
+        usuario: usuario.publicKey,
+      })
+      .signers([usuario])
+      .rpc();
+
+    assert.isNull(await program.account.reserva.fetchNullable(pdaVieja));
+    const nueva = await program.account.reserva.fetch(pdaNueva);
+    assert.equal(nueva.horaInicio, slotE.hora);
+  });
+
+  it("completar y luego cancelar una reserva completada falla", async () => {
+    const [pda] = reservaPda(cancha.publicKey, slotA.fecha, slotA.hora);
+    await program.methods
+      .completarReserva()
+      .accounts({ reserva: pda, cancha: cancha.publicKey, administrador: admin.publicKey })
+      .signers([admin])
+      .rpc();
+    try {
+      await program.methods
+        .cancelarReserva()
+        .accounts({ reserva: pda, cancha: cancha.publicKey, usuario: usuario.publicKey })
+        .signers([usuario])
+        .rpc();
+      assert.fail("Cancelar una reserva completada debería haber fallado");
+    } catch (err) {
+      assert.include(String(err), "CancelacionNoPermitida");
+    }
+  });
+});
+
+// Migrations are an early feature. Currently, they're just a convenient
+// place to store your deploy scripts.
+import { AnchorProvider } from "@coral-xyz/anchor";
+
+export default async function deploy(provider: AnchorProvider): Promise<void> {
+  // No hay estado inicial que sembrar: las canchas las crean los
+  // administradores con `crear_cancha` desde el cliente Java o el
+  // frontend. Este archivo existe para que `anchor migrate` tenga un
+  // punto de entrada estándar.
+  console.log("Desplegando en:", provider.connection.rpcEndpoint);
+  console.log("Wallet del desplegador:", provider.wallet.publicKey.toBase58());
+}
+
+{
+  "accounts": [
+    {
+      "discriminator": [
+        114,
+        5,
+        67,
+        209,
+        95,
+        245,
+        30,
+        122
+      ],
+      "name": "Cancha",
+      "type": {
+        "fields": [
+          {
+            "name": "nombre",
+            "type": "string"
+          },
+          {
+            "name": "ubicacion",
+            "type": "string"
+          },
+          {
+            "name": "precioPorHora",
+            "type": "u64"
+          },
+          {
+            "name": "administrador",
+            "type": "pubkey"
+          },
+          {
+            "name": "activa",
+            "type": "bool"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "discriminator": [
+        104,
+        191,
+        103,
+        32,
+        224,
+        161,
+        110,
+        2
+      ],
+      "name": "Reserva",
+      "type": {
+        "fields": [
+          {
+            "name": "cancha",
+            "type": "pubkey"
+          },
+          {
+            "name": "usuario",
+            "type": "pubkey"
+          },
+          {
+            "name": "fecha",
+            "type": "string"
+          },
+          {
+            "name": "horaInicio",
+            "type": "u8"
+          },
+          {
+            "name": "inicioUnix",
+            "type": "i64"
+          },
+          {
+            "name": "estado",
+            "type": {
+              "defined": {
+                "name": "EstadoReserva"
+              }
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ],
+  "address": "BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ",
+  "errors": [
+    {
+      "code": 6000,
+      "msg": "Solo el administrador o el dueño pueden realizar esta operación.",
+      "name": "AccesoNoAutorizado"
+    },
+    {
+      "code": 6001,
+      "msg": "La cancelación no está permitida: faltan menos de 2 horas para el inicio o la reserva ya está completada/cancelada.",
+      "name": "CancelacionNoPermitida"
+    },
+    {
+      "code": 6002,
+      "msg": "La reserva no está en estado Pendiente.",
+      "name": "ReservaNoPendiente"
+    },
+    {
+      "code": 6003,
+      "msg": "La reserva no está en estado Confirmada.",
+      "name": "ReservaNoConfirmada"
+    },
+    {
+      "code": 6004,
+      "msg": "La hora de inicio debe estar entre 0 y 23.",
+      "name": "HoraInvalida"
+    },
+    {
+      "code": 6005,
+      "msg": "La fecha debe tener formato YYYY-MM-DD (10 caracteres).",
+      "name": "FechaInvalida"
+    },
+    {
+      "code": 6006,
+      "msg": "La cancha no está activa.",
+      "name": "CanchaInactiva"
+    },
+    {
+      "code": 6007,
+      "msg": "El precio por hora debe ser mayor que cero.",
+      "name": "PrecioInvalido"
+    },
+    {
+      "code": 6008,
+      "msg": "El texto supera la longitud máxima permitida.",
+      "name": "TextoDemasiadoLargo"
+    }
+  ],
+  "instructions": [
+    {
+      "accounts": [
+        {
+          "name": "cancha",
+          "writable": true
+        },
+        {
+          "name": "administrador",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "systemProgram"
+        }
+      ],
+      "args": [
+        {
+          "name": "nombre",
+          "type": "string"
+        },
+        {
+          "name": "ubicacion",
+          "type": "string"
+        },
+        {
+          "name": "precioPorHora",
+          "type": "u64"
+        }
+      ],
+      "discriminator": [
+        123,
+        140,
+        213,
+        74,
+        158,
+        26,
+        216,
+        28
+      ],
+      "name": "crearCancha"
+    },
+    {
+      "accounts": [
+        {
+          "name": "reserva",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  115,
+                  101,
+                  114,
+                  118,
+                  97
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cancha"
+              },
+              {
+                "kind": "arg",
+                "path": "fecha"
+              },
+              {
+                "kind": "arg",
+                "path": "horaInicio"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "cancha",
+          "writable": true
+        },
+        {
+          "name": "usuario",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "systemProgram"
+        }
+      ],
+      "args": [
+        {
+          "name": "fecha",
+          "type": "string"
+        },
+        {
+          "name": "horaInicio",
+          "type": "u8"
+        },
+        {
+          "name": "inicioUnix",
+          "type": "i64"
+        }
+      ],
+      "discriminator": [
+        181,
+        129,
+        72,
+        218,
+        85,
+        87,
+        163,
+        197
+      ],
+      "name": "crearReserva"
+    },
+    {
+      "accounts": [
+        {
+          "name": "reserva",
+          "writable": true
+        },
+        {
+          "name": "cancha"
+        },
+        {
+          "name": "administrador",
+          "signer": true
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        124,
+        244,
+        241,
+        58,
+        142,
+        73,
+        141,
+        111
+      ],
+      "name": "confirmarReserva"
+    },
+    {
+      "accounts": [
+        {
+          "name": "reservaAntigua",
+          "writable": true
+        },
+        {
+          "name": "reservaNueva",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  115,
+                  101,
+                  114,
+                  118,
+                  97
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cancha"
+              },
+              {
+                "account": "Reserva",
+                "kind": "account",
+                "path": "reservaAntigua.fecha"
+              },
+              {
+                "kind": "arg",
+                "path": "nuevaHoraInicio"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "cancha"
+        },
+        {
+          "name": "usuario",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "systemProgram"
+        }
+      ],
+      "args": [
+        {
+          "name": "nuevaHoraInicio",
+          "type": "u8"
+        },
+        {
+          "name": "nuevoInicioUnix",
+          "type": "i64"
+        }
+      ],
+      "discriminator": [
+        194,
+        210,
+        239,
+        208,
+        202,
+        227,
+        51,
+        200
+      ],
+      "name": "cambiarHora"
+    },
+    {
+      "accounts": [
+        {
+          "name": "reserva",
+          "writable": true
+        },
+        {
+          "name": "cancha"
+        },
+        {
+          "name": "administrador",
+          "signer": true
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        66,
+        148,
+        18,
+        138,
+        59,
+        231,
+        136,
+        71
+      ],
+      "name": "completarReserva"
+    },
+    {
+      "accounts": [
+        {
+          "name": "reserva",
+          "writable": true
+        },
+        {
+          "name": "cancha"
+        },
+        {
+          "name": "usuario",
+          "signer": true,
+          "writable": true
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        32,
+        163,
+        113,
+        83,
+        88,
+        129,
+        105,
+        187
+      ],
+      "name": "cancelarReserva"
+    }
+  ],
+  "metadata": {
+    "description": "Programa de reservas de canchas de básquetbol en Solana",
+    "name": "reservas_canchas",
+    "spec": "0.1.0",
+    "version": "0.1.0"
+  },
+  "types": [
+    {
+      "name": "EstadoReserva",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Pendiente"
+          },
+          {
+            "name": "Confirmada"
+          },
+          {
+            "name": "Completada"
+          },
+          {
+            "name": "Cancelada"
+          }
+        ]
+      }
+    }
+  ]
+}
+[features]
+seeds = false
+skip-lint = false
+
+[programs.devnet]
+reservas_canchas = "BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ"
+
+[programs.localnet]
+reservas_canchas = "BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[workspace]
+members = [
+    "programs/*"
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+{"dependencies":{"@coral-xyz/anchor":"^0.30.1"},"devDependencies":{"@types/bn.js":"^5.1.6","@types/chai":"^4.3.11","@types/mocha":"^10.0.7","chai":"^4.3.7","mocha":"^10.7.0","prettier":"^3.3.0","ts-mocha":"^10.0.0","typescript":"^5.5.0"},"name":"reservas-canchas-anchor","private":true,"scripts":{"lint":"prettier */*.js */*.ts --check","lint:fix":"prettier */*.js */*.ts --write"},"version":"0.1.0"}
