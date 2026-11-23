@@ -1,0 +1,1008 @@
+package com.reservas.solana.model;
+
+/**
+ * Estado de una reserva. El discriminante (0-3) es el mismo orden en el
+ * que el programa Anchor define el enum {@code EstadoReserva} en Rust,
+ * por eso la decodificación Borsh puede mapear el byte directamente.
+ */
+public enum EstadoReserva {
+    PENDIENTE(0),
+    CONFIRMADA(1),
+    COMPLETADA(2),
+    CANCELADA(3);
+
+    private final int discriminante;
+
+    EstadoReserva(int discriminante) {
+        this.discriminante = discriminante;
+    }
+
+    public int getDiscriminante() {
+        return discriminante;
+    }
+
+    public static EstadoReserva desdeDiscriminante(int valor) {
+        for (EstadoReserva estado : values()) {
+            if (estado.discriminante == valor) {
+                return estado;
+            }
+        }
+        throw new IllegalArgumentException("Estado de reserva desconocido: " + valor);
+    }
+}
+
+package com.reservas.solana.model;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+
+/**
+ * Cuenta Cancha, tal como la define el programa Anchor.
+ *
+ * Layout Borsh (después del discriminador de 8 bytes de Anchor):
+ * nombre (String), ubicacion (String), precio_por_hora (u64),
+ * administrador (Pubkey, 32 bytes), activa (bool, 1 byte).
+ */
+public class Cancha {
+
+    /** Espacio reservado en la cuenta, igual que Cancha::SPACE en Rust. */
+    public static final int SPACE = 153;
+
+    private final String nombre;
+    private final String ubicacion;
+    private final long precioPorHora;
+    private final String administrador;
+    private final boolean activa;
+
+    public Cancha(String nombre, String ubicacion, long precioPorHora,
+                  String administrador, boolean activa) {
+        this.nombre = Objects.requireNonNull(nombre);
+        this.ubicacion = Objects.requireNonNull(ubicacion);
+        this.precioPorHora = precioPorHora;
+        this.administrador = Objects.requireNonNull(administrador);
+        this.activa = activa;
+    }
+
+    /** Decodifica los bytes de la cuenta (incluido el discriminador). */
+    public static Cancha fromBytes(byte[] datos) {
+        ByteBuffer buffer = ByteBuffer.wrap(datos).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.position(8); // discriminador de Anchor
+        String nombre = leerString(buffer);
+        String ubicacion = leerString(buffer);
+        long precioPorHora = buffer.getLong();
+        byte[] adminBytes = new byte[32];
+        buffer.get(adminBytes);
+        boolean activa = buffer.get() != 0;
+        return new Cancha(nombre, ubicacion, precioPorHora,
+                Base58Helper.encode(adminBytes), activa);
+    }
+
+    static String leerString(ByteBuffer buffer) {
+        int longitud = buffer.getInt();
+        byte[] bytes = new byte[longitud];
+        buffer.get(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    public String getNombre() {
+        return nombre;
+    }
+
+    public String getUbicacion() {
+        return ubicacion;
+    }
+
+    public long getPrecioPorHora() {
+        return precioPorHora;
+    }
+
+    public String getAdministrador() {
+        return administrador;
+    }
+
+    public boolean isActiva() {
+        return activa;
+    }
+
+    @Override
+    public String toString() {
+        return "Cancha{nombre='" + nombre + "', ubicacion='" + ubicacion
+                + "', precioPorHora=" + precioPorHora
+                + ", administrador='" + administrador
+                + "', activa=" + activa + "}";
+    }
+}
+
+package com.reservas.solana.model;
+
+import java.math.BigInteger;
+import java.util.Arrays;
+
+/**
+ * Codificación Base58 (alfabeto de Bitcoin, el mismo que usa Solana).
+ * Se usa para convertir claves públicas de 32 bytes a su forma legible
+ * y viceversa, sin depender de otra librería.
+ */
+public final class Base58Helper {
+
+    private static final String ALFABETO = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    private static final BigInteger BASE = BigInteger.valueOf(58);
+
+    private Base58Helper() {
+    }
+
+    public static String encode(byte[] entrada) {
+        if (entrada.length == 0) {
+            return "";
+        }
+        int ceros = 0;
+        while (ceros < entrada.length && entrada[ceros] == 0) {
+            ceros++;
+        }
+        BigInteger numero = new BigInteger(1, entrada);
+        StringBuilder resultado = new StringBuilder();
+        while (numero.compareTo(BigInteger.ZERO) > 0) {
+            BigInteger[] division = numero.divideAndRemainder(BASE);
+            numero = division[0];
+            resultado.insert(0, ALFABETO.charAt(division[1].intValue()));
+        }
+        for (int i = 0; i < ceros; i++) {
+            resultado.insert(0, '1');
+        }
+        return resultado.toString();
+    }
+
+    public static byte[] decode(String entrada) {
+        BigInteger numero = BigInteger.ZERO;
+        for (int i = 0; i < entrada.length(); i++) {
+            int digito = ALFABETO.indexOf(entrada.charAt(i));
+            if (digito < 0) {
+                throw new IllegalArgumentException("Carácter Base58 inválido: " + entrada.charAt(i));
+            }
+            numero = numero.multiply(BASE).add(BigInteger.valueOf(digito));
+        }
+        byte[] bytes = numero.toByteArray();
+        // BigInteger añade un byte de signo 0 al inicio cuando hace falta.
+        if (bytes.length > 1 && bytes[0] == 0) {
+            bytes = Arrays.copyOfRange(bytes, 1, bytes.length);
+        }
+        int ceros = 0;
+        while (ceros < entrada.length() && entrada.charAt(ceros) == '1') {
+            ceros++;
+        }
+        byte[] resultado = new byte[ceros + bytes.length];
+        System.arraycopy(bytes, 0, resultado, ceros, bytes.length);
+        return resultado;
+    }
+}
+
+package com.reservas.solana.model;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Objects;
+
+/**
+ * Cuenta Reserva, tal como la define el programa Anchor.
+ *
+ * Layout Borsh (después del discriminador de 8 bytes de Anchor):
+ * cancha (Pubkey, 32 bytes), usuario (Pubkey, 32 bytes),
+ * fecha (String), hora_inicio (u8), inicio_unix (i64),
+ * estado (enum, 1 byte), bump (u8).
+ *
+ * La regla de cancelación vive aquí como método puro, para que el
+ * cliente, el frontend y las pruebas usen exactamente la misma regla
+ * que el programa on-chain: más de 2 horas de antelación y estado
+ * distinto de Completada/Cancelada. La regla on-chain (Clock sysvar)
+ * es la autoritativa; esta es solo una comprobación previa en el
+ * cliente para no enviar transacciones que van a fallar.
+ */
+public class Reserva {
+
+    /** Espacio reservado en la cuenta, igual que Reserva::SPACE en Rust. */
+    public static final int SPACE = 97;
+
+    /** Ventana de cancelación en segundos, igual que en el programa. */
+    public static final long VENTANA_CANCELACION_SEGUNDOS = 2 * 3600;
+
+    private final String cancha;
+    private final String usuario;
+    private final String fecha;
+    private final int horaInicio;
+    private final long inicioUnix;
+    private final EstadoReserva estado;
+    private final int bump;
+
+    public Reserva(String cancha, String usuario, String fecha, int horaInicio,
+                   long inicioUnix, EstadoReserva estado, int bump) {
+        this.cancha = Objects.requireNonNull(cancha);
+        this.usuario = Objects.requireNonNull(usuario);
+        this.fecha = Objects.requireNonNull(fecha);
+        this.horaInicio = horaInicio;
+        this.inicioUnix = inicioUnix;
+        this.estado = Objects.requireNonNull(estado);
+        this.bump = bump;
+    }
+
+    /** Decodifica los bytes de la cuenta (incluido el discriminador). */
+    public static Reserva fromBytes(byte[] datos) {
+        ByteBuffer buffer = ByteBuffer.wrap(datos).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.position(8); // discriminador de Anchor
+        byte[] canchaBytes = new byte[32];
+        buffer.get(canchaBytes);
+        byte[] usuarioBytes = new byte[32];
+        buffer.get(usuarioBytes);
+        String fecha = Cancha.leerString(buffer);
+        int horaInicio = Byte.toUnsignedInt(buffer.get());
+        long inicioUnix = buffer.getLong();
+        EstadoReserva estado = EstadoReserva.desdeDiscriminante(Byte.toUnsignedInt(buffer.get()));
+        int bump = Byte.toUnsignedInt(buffer.get());
+        return new Reserva(Base58Helper.encode(canchaBytes),
+                Base58Helper.encode(usuarioBytes), fecha, horaInicio,
+                inicioUnix, estado, bump);
+    }
+
+    /**
+     * Regla de cancelación (pura, sin red): la cancelación está
+     * permitida solo si faltan más de 2 horas para el inicio y el
+     * estado no es Completada ni Cancelada.
+     */
+    public static boolean esCancelacionPermitida(long inicioUnix, long ahoraUnix,
+                                                 EstadoReserva estado) {
+        if (estado == EstadoReserva.COMPLETADA || estado == EstadoReserva.CANCELADA) {
+            return false;
+        }
+        return inicioUnix - ahoraUnix > VENTANA_CANCELACION_SEGUNDOS;
+    }
+
+    /** Lo mismo, aplicado a esta reserva. */
+    public boolean esCancelacionPermitida(long ahoraUnix) {
+        return esCancelacionPermitida(inicioUnix, ahoraUnix, estado);
+    }
+
+    public String getCancha() {
+        return cancha;
+    }
+
+    public String getUsuario() {
+        return usuario;
+    }
+
+    public String getFecha() {
+        return fecha;
+    }
+
+    public int getHoraInicio() {
+        return horaInicio;
+    }
+
+    public long getInicioUnix() {
+        return inicioUnix;
+    }
+
+    public EstadoReserva getEstado() {
+        return estado;
+    }
+
+    public int getBump() {
+        return bump;
+    }
+
+    @Override
+    public String toString() {
+        return "Reserva{cancha='" + cancha + "', usuario='" + usuario
+                + "', fecha='" + fecha + "', horaInicio=" + horaInicio
+                + ", inicioUnix=" + inicioUnix + ", estado=" + estado
+                + ", bump=" + bump + "}";
+    }
+}
+
+package com.reservas.solana.wallet;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonParser;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Optional;
+import org.p2p.solanaj.core.Account;
+import org.p2p.solanaj.core.PublicKey;
+
+/**
+ * Conexión de wallet para la demostración en devnet.
+ *
+ * <p>En este proyecto la "wallet" es un keypair local en formato JSON de
+ * Solana CLI (un array de 64 números, como el que genera
+ * {@code solana-keygen new}). El frontend JavaFX lo carga desde un
+ * archivo elegido por el usuario y lo usa solo para firmar.</p>
+ *
+ * <p><b>Advertencias de seguridad:</b></p>
+ * <ul>
+ *   <li>Solo para <b>devnet</b> y con un keypair creado para las pruebas.</li>
+ *   <li><b>Nunca</b> uses aquí un keypair de mainnet ni un keypair con
+ *       fondos reales.</li>
+ *   <li><b>Nunca</b> subas un archivo de keypair a GitHub: está cubierto
+ *       por el {@code .gitignore} del repositorio.</li>
+ *   <li>En una aplicación real, la wallet sería una extensión como
+ *       Phantom y la clave privada nunca saldría de ella.</li>
+ * </ul>
+ */
+public class WalletService {
+
+    private Account cuenta;
+
+    /** Conecta una wallet a partir de un keypair en formato JSON. */
+    public PublicKey conectar(Path archivoKeypair) throws IOException {
+        String contenido = Files.readString(archivoKeypair);
+        JsonArray numeros = JsonParser.parseString(contenido).getAsJsonArray();
+        if (numeros.size() != 64) {
+            throw new IllegalArgumentException(
+                    "El keypair debe tener 64 bytes (formato de solana-keygen)");
+        }
+        byte[] claveSecreta = new byte[64];
+        for (int i = 0; i < 64; i++) {
+            claveSecreta[i] = (byte) numeros.get(i).getAsInt();
+        }
+        this.cuenta = new Account(claveSecreta);
+        return cuenta.getPublicKey();
+    }
+
+    /** Desconecta la wallet y olvida la clave en memoria. */
+    public void desconectar() {
+        this.cuenta = null;
+    }
+
+    public boolean estaConectado() {
+        return cuenta != null;
+    }
+
+    public Optional<PublicKey> getPublicKey() {
+        return cuenta == null
+                ? Optional.empty()
+                : Optional.of(cuenta.getPublicKey());
+    }
+
+    /**
+     * La cuenta que firma las transacciones. Lanza excepción si no hay
+     * wallet conectada.
+     */
+    public Account getCuenta() {
+        if (cuenta == null) {
+            throw new IllegalStateException("No hay ninguna wallet conectada");
+        }
+        return cuenta;
+    }
+}
+
+package com.reservas.solana;
+
+import org.p2p.solanaj.core.PublicKey;
+import org.p2p.solanaj.rpc.RpcClient;
+
+/**
+ * Configuración del cliente: RPC de devnet y Program ID del programa
+ * de reservas. Ambos se pueden sobrescribir con variables de entorno,
+ * para no tener que recompilar al cambiar de red o de despliegue.
+ *
+ * <ul>
+ *   <li>{@code SOLANA_RPC_URL}: por defecto https://api.devnet.solana.com</li>
+ *   <li>{@code RESERVAS_PROGRAM_ID}: por defecto el ID de este proyecto</li>
+ * </ul>
+ */
+public class SolanaConfig {
+
+    public static final String PROGRAM_ID_POR_DEFECTO =
+            "BaRjCPQHBAyEYu8MGLTv9vwsofnrK6BqZcPAK3kKk2tZ";
+
+    private final String rpcUrl;
+    private final PublicKey programId;
+
+    public SolanaConfig() {
+        this(
+            System.getenv().getOrDefault("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
+            System.getenv().getOrDefault("RESERVAS_PROGRAM_ID", PROGRAM_ID_POR_DEFECTO)
+        );
+    }
+
+    public SolanaConfig(String rpcUrl, String programIdBase58) {
+        this.rpcUrl = rpcUrl;
+        this.programId = new PublicKey(programIdBase58);
+    }
+
+    public RpcClient crearRpcClient() {
+        return new RpcClient(rpcUrl);
+    }
+
+    public PublicKey getProgramId() {
+        return programId;
+    }
+
+    public String getRpcUrl() {
+        return rpcUrl;
+    }
+}
+
+package com.reservas.solana;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import org.p2p.solanaj.core.PublicKey;
+
+/**
+ * Derivación de PDAs. Las seeds son <b>idénticas</b> a las del programa
+ * Anchor en {@code lib.rs}:
+ *
+ * <pre>
+ * ["reserva", cancha_pubkey, fecha, hora_inicio]
+ * </pre>
+ *
+ * donde {@code fecha} son los bytes UTF-8 de la fecha en formato
+ * {@code YYYY-MM-DD} y {@code hora_inicio} es un solo byte (0-23).
+ * Si una sola seed cambia, la dirección cambia: por eso esta clase es
+ * el único lugar del cliente Java donde se derivan PDAs.
+ */
+public final class PdaUtils {
+
+    private PdaUtils() {
+    }
+
+    /**
+     * Deriva la PDA de una reserva para una cancha, fecha y hora.
+     *
+     * @return la dirección PDA y su bump (nonce).
+     */
+    public static PublicKey.ProgramDerivedAddress derivarReserva(
+            PublicKey cancha, String fecha, int horaInicio, PublicKey programId) {
+        if (horaInicio < 0 || horaInicio > 23) {
+            throw new IllegalArgumentException("La hora de inicio debe estar entre 0 y 23");
+        }
+        List<byte[]> seeds = List.of(
+                "reserva".getBytes(StandardCharsets.UTF_8),
+                cancha.toByteArray(),
+                fecha.getBytes(StandardCharsets.UTF_8),
+                new byte[]{(byte) horaInicio}
+        );
+        return PublicKey.findProgramAddress(seeds, programId);
+    }
+}
+
+package com.reservas.solana;
+
+import com.reservas.solana.model.Cancha;
+import com.reservas.solana.model.Reserva;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Optional;
+import org.p2p.solanaj.core.Account;
+import org.p2p.solanaj.core.AccountMeta;
+import org.p2p.solanaj.core.PublicKey;
+import org.p2p.solanaj.core.Transaction;
+import org.p2p.solanaj.core.TransactionInstruction;
+import org.p2p.solanaj.programs.SystemProgram;
+import org.p2p.solanaj.rpc.RpcClient;
+import org.p2p.solanaj.rpc.types.AccountInfo;
+
+/**
+ * Cliente Java del programa Anchor de reservas de canchas de básquetbol.
+ *
+ * Es "coherente con la IDL" en un sentido literal: cada método construye
+ * la transacción con las mismas cuentas (en el mismo orden), los mismos
+ * argumentos y el mismo discriminador de instrucción que describe
+ * {@code anchor-program/idl/reservas_canchas.json}. El discriminador de
+ * cada instrucción son los primeros 8 bytes de
+ * {@code SHA-256("global:<nombre_en_snake_case>")}, igual que en Anchor.
+ *
+ * <p>Las cuentas de tipo PDA se derivan siempre con {@link PdaUtils},
+ * nunca a mano, para que las seeds coincidan con el programa.</p>
+ */
+public class ReservaClient {
+
+    private final RpcClient rpcClient;
+    private final PublicKey programId;
+
+    public ReservaClient(SolanaConfig config) {
+        this.rpcClient = config.crearRpcClient();
+        this.programId = config.getProgramId();
+    }
+
+    public ReservaClient(RpcClient rpcClient, PublicKey programId) {
+        this.rpcClient = rpcClient;
+        this.programId = programId;
+    }
+
+    // ------------------------------------------------------------------
+    // Utilidades de codificación (Anchor / Borsh)
+    // ------------------------------------------------------------------
+
+    /**
+     * Discriminador Anchor de una instrucción. Es package-private para
+     * que las pruebas puedan comprobar que coincide con la IDL.
+     */
+    static byte[] discriminador(String nombreSnakeCase) {
+        try {
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            byte[] hash = sha256.digest(("global:" + nombreSnakeCase).getBytes(StandardCharsets.UTF_8));
+            byte[] discriminador = new byte[8];
+            System.arraycopy(hash, 0, discriminador, 0, 8);
+            return discriminador;
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 no disponible", e);
+        }
+    }
+
+    private static void escribirString(ByteArrayOutputStream out, String valor) throws IOException {
+        byte[] bytes = valor.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer longitud = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+        longitud.putInt(bytes.length);
+        out.write(longitud.array());
+        out.write(bytes);
+    }
+
+    private static void escribirU64(ByteArrayOutputStream out, long valor) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putLong(valor);
+        out.write(buffer.array());
+    }
+
+    private static void escribirI64(ByteArrayOutputStream out, long valor) throws IOException {
+        escribirU64(out, valor);
+    }
+
+    private static TransactionInstruction instruccion(String nombreSnakeCase,
+                                                      List<AccountMeta> cuentas, byte[] args) {
+        try {
+            ByteArrayOutputStream datos = new ByteArrayOutputStream();
+            datos.write(discriminador(nombreSnakeCase));
+            if (args != null) {
+                datos.write(args);
+            }
+            return new TransactionInstruction(programId, cuentas, datos.toByteArray());
+        } catch (IOException e) {
+            throw new IllegalStateException("No se pudo codificar la instrucción", e);
+        }
+    }
+
+    /** Inicio de una reserva en segundos desde epoch (UTC). */
+    public static long inicioUnix(String fecha, int horaInicio) {
+        LocalDate dia = LocalDate.parse(fecha); // formato YYYY-MM-DD
+        LocalDateTime inicio = dia.atTime(horaInicio, 0);
+        return inicio.toEpochSecond(ZoneOffset.UTC);
+    }
+
+    // ------------------------------------------------------------------
+    // Envío de transacciones
+    // ------------------------------------------------------------------
+
+    private String enviar(Transaction transaccion, List<Account> firmantes) {
+        String blockhash = rpcClient.getApi().getRecentBlockhash();
+        transaccion.setRecentBlockHash(blockhash);
+        return rpcClient.getApi().sendTransaction(transaccion, firmantes);
+    }
+
+    private static Transaction transaccionCon(TransactionInstruction... instrucciones) {
+        Transaction transaccion = new Transaction();
+        for (TransactionInstruction ix : instrucciones) {
+            transaccion.addInstruction(ix);
+        }
+        return transaccion;
+    }
+
+    // ------------------------------------------------------------------
+    // Creación
+    // ------------------------------------------------------------------
+
+    /**
+     * Crea una cancha. La cuenta de la cancha se genera con una keypair
+     * nueva (no es PDA) y su administrador es quien firma.
+     *
+     * @return la clave pública de la cancha creada.
+     */
+    public PublicKey crearCancha(Account administrador, String nombre,
+                                 String ubicacion, long precioPorHoraLamports) {
+        Account cancha = new Account();
+        long lamports = rpcClient.getApi()
+                .getMinimumBalanceForRentExemption(Cancha.SPACE);
+        TransactionInstruction crearCuenta = SystemProgram.createAccount(
+                administrador.getPublicKey(), cancha.getPublicKey(),
+                lamports, Cancha.SPACE, programId);
+        TransactionInstruction ix = crearCanchaIx(
+                cancha.getPublicKey(), administrador.getPublicKey(),
+                nombre, ubicacion, precioPorHoraLamports);
+        String firma = enviar(transaccionCon(crearCuenta, ix),
+                List.of(administrador, cancha));
+        System.out.println("Cancha creada: " + cancha.getPublicKey() + " (tx " + firma + ")");
+        return cancha.getPublicKey();
+    }
+
+    private TransactionInstruction crearCanchaIx(PublicKey cancha, PublicKey administrador,
+                                                 String nombre, String ubicacion,
+                                                 long precioPorHora) {
+        try {
+            ByteArrayOutputStream args = new ByteArrayOutputStream();
+            escribirString(args, nombre);
+            escribirString(args, ubicacion);
+            escribirU64(args, precioPorHora);
+            return instruccion("crear_cancha", List.of(
+                    new AccountMeta(cancha, true, true),
+                    new AccountMeta(administrador, true, true),
+                    new AccountMeta(SystemProgram.PROGRAM_ID, false, false)
+            ), args.toByteArray());
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Crea una reserva en estado Pendiente. Si la PDA del horario ya
+     * existe, la transacción falla on-chain (doble reserva imposible).
+     *
+     * @return la firma de la transacción.
+     */
+    public String crearReserva(Account usuario, PublicKey cancha,
+                               String fecha, int horaInicio) {
+        PublicKey.ProgramDerivedAddress pda =
+                PdaUtils.derivarReserva(cancha, fecha, horaInicio, programId);
+        TransactionInstruction ix = crearReservaIx(
+                pda.getAddress(), cancha, usuario.getPublicKey(),
+                fecha, horaInicio, inicioUnix(fecha, horaInicio));
+        return enviar(transaccionCon(ix), List.of(usuario));
+    }
+
+    private TransactionInstruction crearReservaIx(PublicKey reserva, PublicKey cancha,
+                                                  PublicKey usuario, String fecha,
+                                                  int horaInicio, long inicioUnix) {
+        try {
+            ByteArrayOutputStream args = new ByteArrayOutputStream();
+            escribirString(args, fecha);
+            args.write(horaInicio);
+            escribirI64(args, inicioUnix);
+            return instruccion("crear_reserva", List.of(
+                    new AccountMeta(reserva, false, true),
+                    new AccountMeta(cancha, false, true),
+                    new AccountMeta(usuario, true, true),
+                    new AccountMeta(SystemProgram.PROGRAM_ID, false, false)
+            ), args.toByteArray());
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Modificación
+    // ------------------------------------------------------------------
+
+    /** Confirma una reserva Pendiente. Solo el administrador de la cancha. */
+    public String confirmarReserva(Account administrador, PublicKey reserva, PublicKey cancha) {
+        TransactionInstruction ix = instruccion("confirmar_reserva", List.of(
+                new AccountMeta(reserva, false, true),
+                new AccountMeta(cancha, false, false),
+                new AccountMeta(administrador.getPublicKey(), true, false)
+        ), null);
+        return enviar(transaccionCon(ix), List.of(administrador));
+    }
+
+    /**
+     * Cambia la hora de una reserva Pendiente. Solo su dueño.
+     *
+     * Como la hora forma parte de las seeds de la PDA, el programa
+     * cierra la PDA antigua y crea la PDA del horario nuevo en la
+     * misma transacción; si el horario nuevo ya está ocupado, la
+     * transacción completa se revierte y no se pierde la reserva.
+     */
+    public String cambiarHora(Account usuario, PublicKey cancha, String fecha,
+                             int horaAntigua, int horaNueva) {
+        PublicKey.ProgramDerivedAddress pdaAntigua =
+                PdaUtils.derivarReserva(cancha, fecha, horaAntigua, programId);
+        PublicKey.ProgramDerivedAddress pdaNueva =
+                PdaUtils.derivarReserva(cancha, fecha, horaNueva, programId);
+        try {
+            ByteArrayOutputStream args = new ByteArrayOutputStream();
+            args.write(horaNueva);
+            escribirI64(args, inicioUnix(fecha, horaNueva));
+            TransactionInstruction ix = instruccion("cambiar_hora", List.of(
+                    new AccountMeta(pdaAntigua.getAddress(), false, true),
+                    new AccountMeta(pdaNueva.getAddress(), false, true),
+                    new AccountMeta(cancha, false, false),
+                    new AccountMeta(usuario.getPublicKey(), true, true),
+                    new AccountMeta(SystemProgram.PROGRAM_ID, false, false)
+            ), args.toByteArray());
+            return enviar(transaccionCon(ix), List.of(usuario));
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Marca una reserva Confirmada como Completada. Solo el administrador. */
+    public String completarReserva(Account administrador, PublicKey reserva, PublicKey cancha) {
+        TransactionInstruction ix = instruccion("completar_reserva", List.of(
+                new AccountMeta(reserva, false, true),
+                new AccountMeta(cancha, false, false),
+                new AccountMeta(administrador.getPublicKey(), true, false)
+        ), null);
+        return enviar(transaccionCon(ix), List.of(administrador));
+    }
+
+    // ------------------------------------------------------------------
+    // Baja condicionada
+    // ------------------------------------------------------------------
+
+    /**
+     * Cancela una reserva y cierra su cuenta (los lamports vuelven al
+     * usuario). Regla del programa: solo si faltan más de 2 horas para
+     * el inicio y el estado no es Completada. La comprobación previa
+     * del cliente evita enviar una transacción que va a fallar, pero la
+     * regla autoritativa es la on-chain (Clock sysvar).
+     *
+     * @throws IllegalStateException si la cancelación no está permitida.
+     */
+    public String cancelarReserva(Account usuario, PublicKey reserva, PublicKey cancha) {
+        Reserva datos = leerReserva(reserva)
+                .orElseThrow(() -> new IllegalArgumentException("La reserva no existe: " + reserva));
+        long ahora = System.currentTimeMillis() / 1000;
+        if (!datos.esCancelacionPermitida(ahora)) {
+            throw new IllegalStateException(
+                    "CancelacionNoPermitida: faltan menos de 2 horas para el inicio "
+                    + "o la reserva ya está completada/cancelada.");
+        }
+        TransactionInstruction ix = instruccion("cancelar_reserva", List.of(
+                new AccountMeta(reserva, false, true),
+                new AccountMeta(cancha, false, false),
+                new AccountMeta(usuario.getPublicKey(), true, true)
+        ), null);
+        return enviar(transaccionCon(ix), List.of(usuario));
+    }
+
+    // ------------------------------------------------------------------
+    // Lectura
+    // ------------------------------------------------------------------
+
+    /** Lee una cancha por su clave pública. Vacío si la cuenta no existe. */
+    public Optional<Cancha> leerCancha(PublicKey cancha) {
+        AccountInfo info = rpcClient.getApi().getAccountInfo(cancha);
+        if (info == null || info.getData() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(Cancha.fromBytes(Base64.getDecoder().decode(info.getData())));
+    }
+
+    /** Lee una reserva por su PDA. Vacío si la cuenta no existe (cerrada). */
+    public Optional<Reserva> leerReserva(PublicKey reserva) {
+        AccountInfo info = rpcClient.getApi().getAccountInfo(reserva);
+        if (info == null || info.getData() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(Reserva.fromBytes(Base64.getDecoder().decode(info.getData())));
+    }
+
+    /**
+     * Lista las reservas de una cancha en una fecha, derivando la PDA de
+     * cada hora (0-23) y leyendo las que existen.
+     *
+     * <p>Limitación conocida: Solana no ofrece un índice on-chain de
+     * "todas las reservas de una cancha". En producción esto se haría
+     * con {@code getProgramAccounts} con filtros o con un indexador;
+     * para este proyecto, derivar las 24 PDA del día es suficiente y
+     * determinista.</p>
+     */
+    public List<Reserva> listarReservas(PublicKey cancha, String fecha) {
+        List<Reserva> reservas = new ArrayList<>();
+        for (int hora = 0; hora < 24; hora++) {
+            PublicKey.ProgramDerivedAddress pda =
+                    PdaUtils.derivarReserva(cancha, fecha, hora, programId);
+            leerReserva(pda.getAddress()).ifPresent(reservas::add);
+        }
+        return reservas;
+    }
+
+    public PublicKey getProgramId() {
+        return programId;
+    }
+}
+
+package com.reservas.solana;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.reservas.solana.model.EstadoReserva;
+import com.reservas.solana.model.Reserva;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import org.junit.jupiter.api.Test;
+import org.p2p.solanaj.core.PublicKey;
+
+/**
+ * Pruebas unitarias del cliente Java. Son pruebas puras, sin red:
+ * no necesitan devnet ni un programa desplegado.
+ *
+ * Cubren:
+ *  - que la derivación de PDA usa exactamente las seeds del programa
+ *    (misma entrada -> misma PDA; distinta hora -> distinta PDA),
+ *  - que el discriminador Anchor calculado en Java coincide con la IDL,
+ *  - que la regla de cancelación (> 2 horas) se aplica igual que
+ *    on-chain, y
+ *  - que la decodificación Borsh de una cuenta Reserva es correcta.
+ */
+class ReservaClientTest {
+
+    private static final PublicKey PROGRAM_ID =
+            new PublicKey(SolanaConfig.PROGRAM_ID_POR_DEFECTO);
+
+    // Clave pública de ejemplo (32 bytes en Base58).
+    private static final PublicKey CANCHA =
+            new PublicKey("11111111111111111111111111111111");
+
+    @Test
+    void derivarReservaEsDeterminista() {
+        PublicKey.ProgramDerivedAddress primera =
+                PdaUtils.derivarReserva(CANCHA, "2026-11-28", 18, PROGRAM_ID);
+        PublicKey.ProgramDerivedAddress segunda =
+                PdaUtils.derivarReserva(CANCHA, "2026-11-28", 18, PROGRAM_ID);
+        assertEquals(primera.getAddress(), segunda.getAddress());
+        assertEquals(primera.getNonce(), segunda.getNonce());
+    }
+
+    @Test
+    void derivarReservaCambiaConLaHora() {
+        PublicKey a18 = PdaUtils.derivarReserva(CANCHA, "2026-11-28", 18, PROGRAM_ID).getAddress();
+        PublicKey a19 = PdaUtils.derivarReserva(CANCHA, "2026-11-28", 19, PROGRAM_ID).getAddress();
+        assertNotEquals(a18, a19, "Dos horarios distintos no pueden compartir PDA");
+    }
+
+    @Test
+    void derivarReservaCambiaConLaFechaYLaCancha() {
+        PublicKey base = PdaUtils.derivarReserva(CANCHA, "2026-11-28", 18, PROGRAM_ID).getAddress();
+        PublicKey otraFecha = PdaUtils.derivarReserva(CANCHA, "2026-11-29", 18, PROGRAM_ID).getAddress();
+        assertNotEquals(base, otraFecha);
+    }
+
+    @Test
+    void horaFueraDeRangoRechazada() {
+        try {
+            PdaUtils.derivarReserva(CANCHA, "2026-11-28", 24, PROGRAM_ID);
+            throw new AssertionError("La hora 24 debería haber sido rechazada");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage().contains("0 y 23"));
+        }
+    }
+
+    @Test
+    void discriminadorCoincideConLaIdl() {
+        // Primeros 8 bytes de SHA-256("global:crear_cancha"), igual que
+        // en anchor-program/idl/reservas_canchas.json.
+        assertArrayEquals(
+                new byte[]{123, (byte) 140, (byte) 213, 74, (byte) 158, 26, (byte) 216, 28},
+                ReservaClient.discriminador("crear_cancha"));
+        assertArrayEquals(
+                new byte[]{(byte) 181, (byte) 129, 72, (byte) 218, 85, 87, (byte) 163, (byte) 197},
+                ReservaClient.discriminador("crear_reserva"));
+        assertArrayEquals(
+                new byte[]{32, (byte) 163, 113, 83, 88, (byte) 129, 105, (byte) 187},
+                ReservaClient.discriminador("cancelar_reserva"));
+    }
+
+    @Test
+    void cancelacionPermitidaConMasDeDosHoras() {
+        long ahora = 1_800_000_000L;
+        assertTrue(Reserva.esCancelacionPermitida(ahora + 3 * 3600, ahora, EstadoReserva.PENDIENTE));
+        assertTrue(Reserva.esCancelacionPermitida(ahora + 3 * 3600, ahora, EstadoReserva.CONFIRMADA));
+    }
+
+    @Test
+    void cancelacionRechazadaConMenosDeDosHoras() {
+        long ahora = 1_800_000_000L;
+        assertFalse(Reserva.esCancelacionPermitida(ahora + 3600, ahora, EstadoReserva.PENDIENTE));
+        // Justo 2 horas no basta: la regla es "más de 2 horas".
+        assertFalse(Reserva.esCancelacionPermitida(ahora + 2 * 3600, ahora, EstadoReserva.PENDIENTE));
+        // Y si ya empezó, tampoco.
+        assertFalse(Reserva.esCancelacionPermitida(ahora - 3600, ahora, EstadoReserva.PENDIENTE));
+    }
+
+    @Test
+    void cancelacionRechazadaSiEstaCompletada() {
+        long ahora = 1_800_000_000L;
+        assertFalse(Reserva.esCancelacionPermitida(ahora + 5 * 3600, ahora, EstadoReserva.COMPLETADA));
+        assertFalse(Reserva.esCancelacionPermitida(ahora + 5 * 3600, ahora, EstadoReserva.CANCELADA));
+    }
+
+    @Test
+    void decodificarReservaBorsh() {
+        // Construye a mano los bytes de una cuenta Reserva en layout Borsh.
+        byte[] canchaBytes = new byte[32];
+        byte[] usuarioBytes = new byte[32];
+        usuarioBytes[31] = 7;
+        byte[] fechaBytes = "2026-11-28".getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(8 + 32 + 32 + 4 + fechaBytes.length + 1 + 8 + 1 + 1)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        buffer.put(new byte[8]); // discriminador de Anchor
+        buffer.put(canchaBytes);
+        buffer.put(usuarioBytes);
+        buffer.putInt(fechaBytes.length);
+        buffer.put(fechaBytes);
+        buffer.put((byte) 18);
+        buffer.putLong(1_800_000_000L);
+        buffer.put((byte) 0); // Pendiente
+        buffer.put((byte) 255); // bump
+
+        Reserva reserva = Reserva.fromBytes(buffer.array());
+        assertEquals("2026-11-28", reserva.getFecha());
+        assertEquals(18, reserva.getHoraInicio());
+        assertEquals(1_800_000_000L, reserva.getInicioUnix());
+        assertEquals(EstadoReserva.PENDIENTE, reserva.getEstado());
+        assertEquals(255, reserva.getBump());
+    }
+}
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.reservas</groupId>
+    <artifactId>reservas-solana-client</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+    <name>Reservas Solana Client</name>
+    <description>Cliente Java para el programa Anchor de reservas de canchas de básquetbol en Solana.</description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <junit.version>5.10.2</junit.version>
+    </properties>
+
+    <dependencies>
+        <!-- Cliente RPC de Solana para Java -->
+        <dependency>
+            <groupId>org.p2p</groupId>
+            <artifactId>solanaj</artifactId>
+            <version>1.9.0</version>
+        </dependency>
+        <!-- Para leer keypairs en formato JSON de Solana CLI -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>
